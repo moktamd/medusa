@@ -5,6 +5,8 @@ import http from "http"
 import { scheduleJob } from "node-schedule"
 import os from "os"
 import path from "path"
+import { OTLPTraceExporter } from "@medusajs/framework/opentelemetry/exporter-trace-otlp-http"
+import { OTLPMetricExporter } from "@medusajs/framework/opentelemetry/exporter-metrics-otlp-http"
 
 import {
   ContainerRegistrationKeys,
@@ -27,10 +29,12 @@ import RbacFeatureFlag from "../feature-flags/rbac"
 import loaders, { initializeContainer } from "../loaders"
 import { reloadResources } from "./utils/dev-server"
 import { HMRReloadError } from "./utils/dev-server/errors"
+import { registerOtel } from "../instrumentation"
 
 const EVERY_SIXTH_HOUR = "0 */6 * * *"
 const CRON_SCHEDULE = EVERY_SIXTH_HOUR
 const INSTRUMENTATION_FILE = "instrumentation"
+const MEDUSA_CLOUD_EXECUTION_CONTEXT = "medusa-cloud"
 
 function parseValueOrPercentage(value: string, base: number): number {
   if (typeof value !== "string") {
@@ -58,6 +62,45 @@ function parseValueOrPercentage(value: string, base: number): number {
   }
 }
 
+async function registerCloudInstrumentation(container: MedusaContainer) {
+  if (!process.env.MEDUSA_CLOUD_OTLP_EXPORTER_URL) {
+    console.error("MEDUSA_CLOUD_OTLP_EXPORTER_URL is not set")
+    return
+  }
+
+  const instrumentTypes =
+    process.env.MEDUSA_CLOUD_OTLP_INSTRUMENT_TYPES?.split(",") || []
+
+  const sdk = registerOtel({
+    serviceName: "medusajs",
+    exporter: new OTLPTraceExporter({
+      url: process.env.MEDUSA_CLOUD_OTLP_EXPORTER_URL,
+    }),
+    metricsExporter: new OTLPMetricExporter({
+      url: process.env.MEDUSA_CLOUD_OTLP_EXPORTER_URL,
+    }),
+    instrument: {
+      http: instrumentTypes.includes("http"),
+      workflows: instrumentTypes.includes("workflows"),
+      query: instrumentTypes.includes("query"),
+      db: instrumentTypes.includes("db"),
+      cache: instrumentTypes.includes("cache"),
+      runtime: instrumentTypes.includes("runtime"),
+      eventLoop: instrumentTypes.includes("eventLoop"),
+    },
+  })
+
+  process.on("SIGTERM", () => {
+    sdk
+      .shutdown()
+      .then(
+        () => console.info("Cloud OTEL SDK was shut down successfully"),
+        (err) => console.info("Error shutting down Cloud OTEL SDK", err)
+      )
+      .finally(() => process.exit(0))
+  })
+}
+
 /**
  * Imports the "instrumentation.js" file from the root of the
  * directory and invokes the register function. The existence
@@ -69,6 +112,13 @@ export async function registerInstrumentation(directory: string) {
     skipDbConnection: true,
   })
   const logger = container.resolve(ContainerRegistrationKeys.LOGGER)
+
+  const isCloud =
+    process.env.EXECUTION_CONTEXT === MEDUSA_CLOUD_EXECUTION_CONTEXT
+
+  if (isCloud) {
+    await registerCloudInstrumentation(container)
+  }
 
   const fileSystem = new FileSystem(directory)
   const exists =

@@ -5,14 +5,20 @@ import {
   Query,
 } from "@medusajs/framework"
 import { ApiLoader } from "@medusajs/framework/http"
-import { SpanStatusCode } from "@medusajs/framework/opentelemetry/api"
+import { SpanStatusCode, metrics } from "@medusajs/framework/opentelemetry/api"
 import type { NodeSDKConfiguration } from "@medusajs/framework/opentelemetry/sdk-node"
 import type { SpanExporter } from "@medusajs/framework/opentelemetry/sdk-trace-node"
+import type { PushMetricExporter } from "@medusajs/framework/opentelemetry/sdk-metrics"
 import { TransactionOrchestrator } from "@medusajs/framework/orchestration"
 import { Tracer } from "@medusajs/framework/telemetry"
 import { ICachingModuleService } from "@medusajs/framework/types"
 import { camelToSnakeCase, FeatureFlag } from "@medusajs/framework/utils"
 import CacheModule from "../modules/caching"
+import {
+  constants,
+  monitorEventLoopDelay,
+  PerformanceObserver,
+} from "perf_hooks"
 
 const EXCLUDED_RESOURCES = [".vite", "virtual:"]
 
@@ -366,6 +372,99 @@ export function instrumentCache() {
   }
 }
 
+export function startEventLoopMonitoring() {
+  const elMonitor = monitorEventLoopDelay({ resolution: 10 })
+  elMonitor.enable()
+
+  const meter = metrics.getMeter("nodejs-event-loop-meter")
+
+  meter
+    .createObservableGauge("nodejs_eventloop_delay_mean_ms", {
+      description: "Mean event loop delay in milliseconds",
+    })
+    .addCallback((observableResult) => {
+      observableResult.observe(elMonitor.mean / 1e6)
+    })
+
+  meter
+    .createObservableGauge("nodejs_eventloop_delay_max_ms", {
+      description: "Max event loop delay in milliseconds",
+    })
+    .addCallback((observableResult) => {
+      observableResult.observe(elMonitor.max / 1e6)
+    })
+
+  console.log("Event loop monitoring started.")
+}
+
+function getGcTypeName(kind) {
+  switch (kind) {
+    case constants.NODE_PERFORMANCE_GC_MINOR:
+      return "minor"
+    case constants.NODE_PERFORMANCE_GC_MAJOR:
+      return "major"
+    case constants.NODE_PERFORMANCE_GC_INCREMENTAL:
+      return "incremental"
+    case constants.NODE_PERFORMANCE_GC_WEAKCB:
+      return "weakcb"
+    default:
+      return "unknown"
+  }
+}
+
+export function startRuntimeMonitoring() {
+  const meter = metrics.getMeter("nodejs-runtime-meter")
+
+  const heapUsedGauge = meter.createObservableGauge(
+    "nodejs_memory_heap_used_bytes",
+    {
+      description: "V8 heap used",
+    }
+  )
+
+  const heapTotalGauge = meter.createObservableGauge(
+    "nodejs_memory_heap_total_bytes",
+    {
+      description: "V8 heap total",
+    }
+  )
+
+  const rssGauge = meter.createObservableGauge("nodejs_memory_rss_bytes", {
+    description: "Resident Set Size",
+  })
+
+  meter.addBatchObservableCallback(
+    (observableResult) => {
+      const memUsage = process.memoryUsage()
+      observableResult.observe(heapUsedGauge, memUsage.heapUsed)
+      observableResult.observe(heapTotalGauge, memUsage.heapTotal)
+      observableResult.observe(rssGauge, memUsage.rss)
+    },
+    [heapUsedGauge, heapTotalGauge, rssGauge]
+  )
+
+  // Garbage collection - We use a Histogram for GC because we want to measure the duration of discrete events
+  const gcHistogram = meter.createHistogram("nodejs_gc_duration_seconds", {
+    description: "Garbage collection duration",
+  })
+
+  const gcObserver = new PerformanceObserver((list) => {
+    const entries = list.getEntries()
+    for (const entry of entries) {
+      const durationSeconds = entry.duration / 1000
+      const gcKind =
+        "detail" in entry ? (entry as any).detail.kind : (entry as any).kind
+
+      gcHistogram.record(durationSeconds, {
+        "gc.type": getGcTypeName(gcKind),
+      })
+    }
+  })
+
+  // Start observing GC events
+  gcObserver.observe({ entryTypes: ["gc"] })
+}
+
 /**
  * A helper function to configure the OpenTelemetry SDK with some defaults.
  * For better/more control, please configure the SDK manually.
@@ -374,6 +473,7 @@ export function instrumentCache() {
  * telemetry to work
  *
  * - @opentelemetry/sdk-node
+ * - @opentelemetry/sdk-metrics
  * - @opentelemetry/resources
  * - @opentelemetry/sdk-trace-node
  * - @opentelemetry/instrumentation-pg
@@ -383,17 +483,21 @@ export function registerOtel(
   options: Partial<NodeSDKConfiguration> & {
     serviceName: string
     exporter?: SpanExporter
+    metricsExporter?: PushMetricExporter
     instrument?: Partial<{
       http: boolean
       query: boolean
       workflows: boolean
       db: boolean
       cache: boolean
+      runtime: boolean
+      eventLoop: boolean
     }>
   }
 ) {
   const {
     exporter,
+    metricsExporter,
     serviceName,
     instrument,
     instrumentations,
@@ -410,8 +514,12 @@ export function registerOtel(
   } = require("@medusajs/framework/opentelemetry/resources")
   const { NodeSDK } = require("@medusajs/framework/opentelemetry/sdk-node")
   const {
-    SimpleSpanProcessor,
+    BatchSpanProcessor,
   } = require("@medusajs/framework/opentelemetry/sdk-trace-node")
+
+  const {
+    PeriodicExportingMetricReader,
+  } = require("@medusajs/framework/opentelemetry/sdk-metrics")
 
   if (instrument.db) {
     const {
@@ -443,11 +551,27 @@ export function registerOtel(
           "service.name": serviceName,
         })
       : new Resource({ "service.name": serviceName }),
-    spanProcessor: new SimpleSpanProcessor(exporter),
+    spanProcessor: new BatchSpanProcessor(exporter),
+    metricReader: new PeriodicExportingMetricReader({
+      exporter: metricsExporter,
+      exportIntervalMillis: 10000,
+    }),
     ...nodeSdkOptions,
     instrumentations: instrumentations,
   } satisfies Partial<NodeSDKConfiguration>)
 
   sdk.start()
+
+  // We should start any metrics monitoring after the sdk has been started.
+  if (instrument.eventLoop) {
+    startEventLoopMonitoring()
+  }
+
+  if (instrument.runtime) {
+    startRuntimeMonitoring()
+  }
+
+  // TODO: We need to tear down the event loop and runtime monitoring.
+
   return sdk
 }
