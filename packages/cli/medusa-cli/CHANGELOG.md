@@ -1,5 +1,16 @@
 # Change Log
 
+## 2.13.6
+
+### Patch Changes
+
+- [#14917](https://github.com/medusajs/medusa/pull/14917) [`7c5e5e37f632716e5c6846c12d0dee7efe1e0b96`](https://github.com/medusajs/medusa/commit/7c5e5e37f632716e5c6846c12d0dee7efe1e0b96) Thanks [@buley](https://github.com/buley)! - fix(cli): close leaked file descriptor in clearProject
+
+- Updated dependencies []:
+  - @medusajs/utils@2.13.6
+  - @medusajs/deps@2.13.6
+  - @medusajs/telemetry@2.13.6
+
 ## 2.13.5
 
 ### Patch Changes
